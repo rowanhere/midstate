@@ -568,16 +568,16 @@ pub async fn run_stratum_client_with_options(
                                 .unwrap_or_else(default_share_target);
 
                             if params.get(3).is_none() || params.get(4).is_none() {
-                                if let Some((network_target, share_target)) =
+                                let Some((network_target, share_target)) =
                                     fetch_pool_targets(&http_client, &audit_base_url).await
-                                {
-                                    n_target = network_target;
-                                    s_target = share_target;
-                                } else {
-                                    tracing::warn!(
-                                        "pool notify omitted explicit targets and audit stats were unavailable; falling back to template target"
+                                else {
+                                    tracing::error!(
+                                        "pool notify omitted explicit targets and audit stats were unavailable; refusing unsafe fallback target"
                                     );
-                                }
+                                    break;
+                                };
+                                n_target = network_target;
+                                s_target = share_target;
                             }
                             {
                                 let mut s = stats.write().unwrap();

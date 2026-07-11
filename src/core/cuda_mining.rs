@@ -1076,15 +1076,14 @@ impl CudaMiner {
                 continue;
             }
             hits.sort_by_key(|h| matches!(h, MiningResult::Share(_)));
-            for hit in &hits {
-                match hit {
-                    MiningResult::Block(_) => {
-                        self.stats.accepted_blocks.fetch_add(1, Ordering::Relaxed);
-                    }
-                    MiningResult::Share(_) => {
-                        self.stats.accepted_shares.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+            let share_candidates = hits
+                .iter()
+                .filter(|hit| matches!(hit, MiningResult::Share(_)))
+                .count() as u64;
+            if share_candidates > 0 {
+                self.stats
+                    .accepted_shares
+                    .fetch_add(share_candidates, Ordering::Relaxed);
             }
 
             let mut it = hits.into_iter();
