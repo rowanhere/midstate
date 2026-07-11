@@ -247,6 +247,9 @@ pub fn spawn_stratum_dashboard(
         let mut ticker = stats_interval_secs
             .filter(|s| *s > 0)
             .map(|s| tokio::time::interval(std::time::Duration::from_secs(s)));
+        if let Some(ticker) = ticker.as_mut() {
+            ticker.tick().await;
+        }
         let mut last_hashes = 0;
         let mut last_time = Instant::now();
         let mut last_cuda_nonces: std::collections::BTreeMap<i32, u64> =
@@ -303,11 +306,12 @@ pub fn spawn_stratum_dashboard(
         let share_target_f64 = u256_to_f64(primitive_types::U256::from_big_endian(&share_target));
 
         loop {
+            let mut manual = false;
             if let Some(ticker) = ticker.as_mut() {
                 tokio::select! {
                     line = lines.next_line() => {
                         match line {
-                            Ok(Some(_)) => {}
+                            Ok(Some(_)) => manual = true,
                             Ok(None) => break,
                             Err(_) => break,
                         }
@@ -326,14 +330,13 @@ pub fn spawn_stratum_dashboard(
             } else {
                 0.0
             };
-
-            println!("\n== MINER STATUS ==");
-            println!("Hashrate:      {}", format_hashrate(rate));
+            let total_rate = format_hashrate(rate);
+            let mut cuda_lines = Vec::new();
+            let mut cuda_compact = Vec::new();
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let cuda = crate::core::cuda_mining::cuda_dashboard_snapshot();
                 if !cuda.is_empty() {
-                    println!("CUDA GPUs:");
                     for gpu in cuda {
                         let previous = last_cuda_nonces
                             .insert(gpu.ordinal, gpu.nonce_equivalents)
@@ -343,19 +346,26 @@ pub fn spawn_stratum_dashboard(
                         } else {
                             0.0
                         };
-                        println!(
+                        let gpu_rate_fmt = format_hashrate(gpu_rate);
+                        cuda_compact.push(format!("GPU{}={}", gpu.ordinal, gpu_rate_fmt));
+                        cuda_lines.push(format!(
                             "  GPU {:>2}: {:>10} | shares {} | blocks {} | {}",
                             gpu.ordinal,
-                            format_hashrate(gpu_rate),
+                            gpu_rate_fmt,
                             gpu.accepted_shares,
                             gpu.accepted_blocks,
                             gpu.name
-                        );
+                        ));
                     }
                 }
             }
 
             let s = stats_clone.read().unwrap().clone();
+            if !manual && current == last_hashes && s.network_target == [0u8; 32] {
+                last_time = now;
+                continue;
+            }
+
             if s.network_target != [0u8; 32] {
                 let target_f64 = u256_to_f64(primitive_types::U256::from_big_endian(&s.network_target));
 
@@ -374,6 +384,38 @@ pub fn spawn_stratum_dashboard(
                     0.0
                 };
 
+                if !manual {
+                    if cuda_compact.is_empty() {
+                        tracing::info!(
+                            "STATS total={} network={} shares={} acc / {} rej",
+                            total_rate,
+                            format_hashrate(network_nps),
+                            s.accepted_shares,
+                            s.rejected_shares
+                        );
+                    } else {
+                        tracing::info!(
+                            "STATS total={} cuda=[{}] network={} shares={} acc / {} rej",
+                            total_rate,
+                            cuda_compact.join(", "),
+                            format_hashrate(network_nps),
+                            s.accepted_shares,
+                            s.rejected_shares
+                        );
+                    }
+                    last_hashes = current;
+                    last_time = now;
+                    continue;
+                }
+
+                println!("\n== MINER STATUS ==");
+                println!("Hashrate:      {}", total_rate);
+                if !cuda_lines.is_empty() {
+                    println!("CUDA GPUs:");
+                    for line in &cuda_lines {
+                        println!("{line}");
+                    }
+                }
                 println!("Network:       {}", format_hashrate(network_nps));
 
                 if share_pct < 0.001 {
@@ -400,6 +442,19 @@ pub fn spawn_stratum_dashboard(
                     }
                 );
             } else {
+                if !manual {
+                    last_hashes = current;
+                    last_time = now;
+                    continue;
+                }
+                println!("\n== MINER STATUS ==");
+                println!("Hashrate:      {}", total_rate);
+                if !cuda_lines.is_empty() {
+                    println!("CUDA GPUs:");
+                    for line in &cuda_lines {
+                        println!("{line}");
+                    }
+                }
                 println!("Network:       Waiting for job...");
             }
 
