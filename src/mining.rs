@@ -579,9 +579,18 @@ pub async fn run_stratum_client_with_options(
                                 n_target = network_target;
                                 s_target = share_target;
                             }
+
+                            let block_target = if n_target >= s_target {
+                                tracing::warn!(
+                                    "pool network target is easier than share target; mining shares only until pool/node reports a sane network target"
+                                );
+                                [0u8; 32]
+                            } else {
+                                n_target
+                            };
                             {
                                 let mut s = stats.write().unwrap();
-                                s.network_target = n_target;
+                                s.network_target = block_target;
                             }
                             let calculated_hash = crate::core::types::compute_header_hash(&header);
                             
@@ -671,7 +680,7 @@ pub async fn run_stratum_client_with_options(
                                     if nc.load(Ordering::Relaxed) { break; }
                                     
                                     if let Some(res) = crate::core::gpu_mining::mine(
-                                        m_hash, n_target, Some(s_target), threads, nc.clone(), hc.clone()
+                                        m_hash, block_target, Some(s_target), threads, nc.clone(), hc.clone()
                                     ) {
                                         let nonce = match res {
                                             crate::core::extension::MiningResult::Block(ext) => ext.nonce,

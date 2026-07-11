@@ -732,11 +732,20 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, audit_bin
                         let mut m_hash = [0u8; 32];
                         hex::decode_to_slice(m_hex, &mut m_hash).unwrap();
 
+                        let job_network_target = if n_target >= state_clone.share_target {
+                            tracing::warn!(
+                                "backend network target is easier than pool share target; disabling block submissions for this job"
+                            );
+                            [0u8; 32]
+                        } else {
+                            n_target
+                        };
+
                         let job = Job {
                             job_id: job_counter,
                             mining_hash: m_hash,
                             share_target: state_clone.share_target,
-                            network_target: n_target,
+                            network_target: job_network_target,
                             batch_template: template["batch_template"].clone(),
                             height: tip_height.saturating_add(1),
                             committed_scores: std::sync::Arc::new(shares_vec.clone()),
