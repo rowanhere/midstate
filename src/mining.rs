@@ -580,9 +580,11 @@ pub async fn run_stratum_client_with_options(
                                 s_target = share_target;
                             }
 
-                            let block_target = if n_target >= s_target {
+                            let dashboard_target = if n_target >= s_target {
                                 tracing::warn!(
-                                    "pool network target is easier than share target; mining shares only until pool/node reports a sane network target"
+                                    "pool network target {} is easier than share target {}; mining pool shares only",
+                                    hex::encode(n_target),
+                                    hex::encode(s_target)
                                 );
                                 [0u8; 32]
                             } else {
@@ -590,8 +592,14 @@ pub async fn run_stratum_client_with_options(
                             };
                             {
                                 let mut s = stats.write().unwrap();
-                                s.network_target = block_target;
+                                s.network_target = dashboard_target;
                             }
+                            tracing::info!(
+                                "job {} targets: share={} network={} mode=share-only",
+                                job_id,
+                                hex::encode(s_target),
+                                hex::encode(n_target)
+                            );
                             let calculated_hash = crate::core::types::compute_header_hash(&header);
                             
                             if calculated_hash != m_hash {
@@ -674,13 +682,14 @@ pub async fn run_stratum_client_with_options(
                             let j_id = job_id;
                             let nc = new_cancel.clone();
                             let hc = hash_counter.clone();
+                            let share_only_target = [0u8; 32];
                             
                             std::thread::spawn(move || {
                                 loop {
                                     if nc.load(Ordering::Relaxed) { break; }
                                     
                                     if let Some(res) = crate::core::gpu_mining::mine(
-                                        m_hash, block_target, Some(s_target), threads, nc.clone(), hc.clone()
+                                        m_hash, share_only_target, Some(s_target), threads, nc.clone(), hc.clone()
                                     ) {
                                         let nonce = match res {
                                             crate::core::extension::MiningResult::Block(ext) => ext.nonce,
