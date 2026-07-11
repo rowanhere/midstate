@@ -246,6 +246,8 @@ pub fn spawn_stratum_dashboard(
         let mut line = String::new();
         let mut last_hashes = 0;
         let mut last_time = Instant::now();
+        let mut last_cuda_nonces: std::collections::BTreeMap<i32, u64> =
+            std::collections::BTreeMap::new();
 
         // Hardcoded share target matching the current pool server (0x000f...).
         let share_target = {
@@ -297,6 +299,31 @@ pub fn spawn_stratum_dashboard(
 
             println!("\n== MINER STATUS ==");
             println!("Hashrate:      {:.2} nonces/s", rate);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let cuda = crate::core::cuda_mining::cuda_dashboard_snapshot();
+                if !cuda.is_empty() {
+                    println!("CUDA GPUs:");
+                    for gpu in cuda {
+                        let previous = last_cuda_nonces
+                            .insert(gpu.ordinal, gpu.nonce_equivalents)
+                            .unwrap_or(gpu.nonce_equivalents);
+                        let gpu_rate = if elapsed > 0.0 {
+                            gpu.nonce_equivalents.saturating_sub(previous) as f64 / elapsed
+                        } else {
+                            0.0
+                        };
+                        println!(
+                            "  GPU {:>2}: {:>10.2} nonces/s | shares {} | blocks {} | {}",
+                            gpu.ordinal,
+                            gpu_rate,
+                            gpu.accepted_shares,
+                            gpu.accepted_blocks,
+                            gpu.name
+                        );
+                    }
+                }
+            }
 
             let s = stats_clone.read().unwrap().clone();
             if s.network_target != [0u8; 32] {

@@ -66,6 +66,50 @@ struct MinerState {
     pending: VecDeque<MiningResult>,
 }
 
+struct CudaDeviceStats {
+    ordinal: i32,
+    name: String,
+    nonce_equivalents: AtomicU64,
+    accepted_shares: AtomicU64,
+    accepted_blocks: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CudaDashboardStat {
+    pub ordinal: i32,
+    pub name: String,
+    pub nonce_equivalents: u64,
+    pub accepted_shares: u64,
+    pub accepted_blocks: u64,
+}
+
+fn cuda_stats_registry() -> &'static Mutex<Vec<Arc<CudaDeviceStats>>> {
+    static CUDA_STATS: OnceLock<Mutex<Vec<Arc<CudaDeviceStats>>>> = OnceLock::new();
+    CUDA_STATS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_cuda_stats(stats: Arc<CudaDeviceStats>) {
+    cuda_stats_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(stats);
+}
+
+pub fn cuda_dashboard_snapshot() -> Vec<CudaDashboardStat> {
+    cuda_stats_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|s| CudaDashboardStat {
+            ordinal: s.ordinal,
+            name: s.name.clone(),
+            nonce_equivalents: s.nonce_equivalents.load(Ordering::Relaxed),
+            accepted_shares: s.accepted_shares.load(Ordering::Relaxed),
+            accepted_blocks: s.accepted_blocks.load(Ordering::Relaxed),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 struct CudaSettings {
@@ -511,6 +555,7 @@ pub struct CudaMiner {
     d_winners: CuDevicePtr,
     adapter_name: String,
     state: Mutex<MinerState>,
+    stats: Arc<CudaDeviceStats>,
 }
 
 unsafe impl Send for CudaMiner {}
@@ -583,6 +628,13 @@ impl CudaMiner {
                 (api.cu_mem_alloc)(&mut d_winners, WINNERS_BYTES),
                 "cuMemAlloc(winners)",
             )?;
+            let stats = Arc::new(CudaDeviceStats {
+                ordinal,
+                name: adapter_name.clone(),
+                nonce_equivalents: AtomicU64::new(0),
+                accepted_shares: AtomicU64::new(0),
+                accepted_blocks: AtomicU64::new(0),
+            });
 
             Ok(Self {
                 api,
@@ -599,12 +651,17 @@ impl CudaMiner {
                     job: None,
                     pending: VecDeque::new(),
                 }),
+                stats,
             })
         }
     }
 
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
+    }
+
+    fn stats(&self) -> Arc<CudaDeviceStats> {
+        self.stats.clone()
     }
 
     fn groups(n_nonces: u32) -> u32 {
@@ -763,6 +820,7 @@ impl CudaMiner {
             remaining -= k as u64;
             let add = (n_nonces as u64).saturating_mul(k as u64) / total;
             hash_counter.fetch_add(add, Ordering::Relaxed);
+            self.stats.nonce_equivalents.fetch_add(add, Ordering::Relaxed);
         }
 
         if !collect_winners {
@@ -867,6 +925,16 @@ impl CudaMiner {
                 continue;
             }
             hits.sort_by_key(|h| matches!(h, MiningResult::Share(_)));
+            for hit in &hits {
+                match hit {
+                    MiningResult::Block(_) => {
+                        self.stats.accepted_blocks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MiningResult::Share(_) => {
+                        self.stats.accepted_shares.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
 
             let mut it = hits.into_iter();
             let first = it.next().unwrap();
@@ -995,6 +1063,7 @@ impl CudaFarm {
                 Ok(miner) => match miner.self_test() {
                     Ok(()) => {
                         tracing::info!("CUDA mining enabled on {}", miner.adapter_name());
+                        register_cuda_stats(miner.stats());
                         miners.push(Arc::new(miner));
                     }
                     Err(e) => {
