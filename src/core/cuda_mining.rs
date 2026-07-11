@@ -119,6 +119,7 @@ fn settings() -> &'static CudaSettings {
 }
 
 static CUDA_DUTY_MILLI: AtomicU32 = AtomicU32::new(0);
+static CUDA_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_cuda_duty(duty: f32) {
     CUDA_DUTY_MILLI.store((duty.clamp(0.02, 1.0) * 1000.0) as u32, Ordering::Relaxed);
@@ -1158,7 +1159,9 @@ pub fn mine_cuda_or_cpu(
     if let Some(farm) = shared() {
         return farm.mine_gpu(midstate, target, pool_target, cancel, hash_counter);
     }
-    tracing::warn!("CUDA backend requested but no usable CUDA GPU; mining on CPU");
+    if !CUDA_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("CUDA backend requested but no usable CUDA GPU; mining on CPU");
+    }
     mine_extension(midstate, target, pool_target, threads, cancel, hash_counter)
 }
 
