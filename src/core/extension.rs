@@ -170,13 +170,13 @@ pub fn mine_extension(
     if let Some((res, attempts)) = result {
         match &res {
             MiningResult::Block(ext) => {
-                tracing::info!(
+                tracing::warn!(
                     "Found valid block extension! nonce={} attempts={} hash={} threads={}",
                     ext.nonce, attempts, hex::encode(ext.final_hash), num_threads
                 );
             }
             MiningResult::Share(ext) => {
-                tracing::info!(
+                tracing::debug!(
                     "Found valid pool share! nonce={} attempts={} hash={} threads={}",
                     ext.nonce, attempts, hex::encode(ext.final_hash), num_threads
                 );
@@ -219,14 +219,14 @@ fn mine_extension_single(
 
         for &(nonce, final_hash) in &results {
             if final_hash < target {
-                tracing::info!(
+                tracing::warn!(
                     "Found valid block extension! nonce={} attempts={} hash={}",
                     nonce, attempts, hex::encode(final_hash)
                 );
                 return Some(MiningResult::Block(Extension { nonce, final_hash }));
             } else if let Some(pt) = pool_target {
                 if final_hash < pt {
-                    tracing::info!(
+                    tracing::debug!(
                         "Found valid pool share! nonce={} attempts={} hash={}",
                         nonce, attempts, hex::encode(final_hash)
                     );

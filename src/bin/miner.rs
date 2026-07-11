@@ -39,19 +39,28 @@ struct Cli {
     /// Print miner dashboard automatically every N seconds. 0 = only on ENTER.
     #[arg(long = "stats-interval", default_value_t = 0)]
     stats_interval: u64,
+
+    /// Hide normal INFO logs so the status dashboard stays clean.
+    #[arg(long = "dashboard-only", alias = "quiet", default_value_t = false)]
+    dashboard_only: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let default_filter = if cli.dashboard_only {
+        "midstate=warn,tower_http=warn"
+    } else {
+        "midstate=info,tower_http=debug"
+    };
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "midstate=info,tower_http=debug".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    let cli = Cli::parse();
 
     midstate::core::gpu_mining::set_backend(match cli.backend.to_ascii_lowercase().as_str() {
         "cuda" => midstate::core::gpu_mining::Backend::Cuda,

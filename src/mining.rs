@@ -332,7 +332,6 @@ pub fn spawn_stratum_dashboard(
             };
             let total_rate = format_hashrate(rate);
             let mut cuda_lines = Vec::new();
-            let mut cuda_compact = Vec::new();
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let cuda = crate::core::cuda_mining::cuda_dashboard_snapshot();
@@ -347,7 +346,6 @@ pub fn spawn_stratum_dashboard(
                             0.0
                         };
                         let gpu_rate_fmt = format_hashrate(gpu_rate);
-                        cuda_compact.push(format!("GPU{}={}", gpu.ordinal, gpu_rate_fmt));
                         cuda_lines.push(format!(
                             "  GPU {:>2}: {:>10} | shares {} | blocks {} | {}",
                             gpu.ordinal,
@@ -384,30 +382,6 @@ pub fn spawn_stratum_dashboard(
                     0.0
                 };
 
-                if !manual {
-                    if cuda_compact.is_empty() {
-                        tracing::info!(
-                            "STATS total={} network={} shares={} acc / {} rej",
-                            total_rate,
-                            format_hashrate(network_nps),
-                            s.accepted_shares,
-                            s.rejected_shares
-                        );
-                    } else {
-                        tracing::info!(
-                            "STATS total={} cuda=[{}] network={} shares={} acc / {} rej",
-                            total_rate,
-                            cuda_compact.join(", "),
-                            format_hashrate(network_nps),
-                            s.accepted_shares,
-                            s.rejected_shares
-                        );
-                    }
-                    last_hashes = current;
-                    last_time = now;
-                    continue;
-                }
-
                 println!("\n== MINER STATUS ==");
                 println!("Hashrate:      {}", total_rate);
                 if !cuda_lines.is_empty() {
@@ -442,11 +416,6 @@ pub fn spawn_stratum_dashboard(
                     }
                 );
             } else {
-                if !manual {
-                    last_hashes = current;
-                    last_time = now;
-                    continue;
-                }
                 println!("\n== MINER STATUS ==");
                 println!("Hashrate:      {}", total_rate);
                 if !cuda_lines.is_empty() {
@@ -665,7 +634,7 @@ pub async fn run_stratum_client_with_options(
                                 }
                             });
                         } else if msg["result"].as_bool() == Some(true) && msg["id"].as_u64() == Some(2) {
-                            tracing::info!("share accepted");
+                            tracing::debug!("share accepted");
                             stats.write().unwrap().accepted_shares += 1; 
                         } else if let Some(err) = msg["error"].as_str() {
                             tracing::warn!("share rejected: {}", err);
