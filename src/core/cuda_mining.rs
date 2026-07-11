@@ -209,6 +209,17 @@ fn cuda_duty() -> f32 {
     settings().duty
 }
 
+fn embedded_fatbin() -> Option<&'static [u8]> {
+    #[cfg(midstate_cuda_embedded)]
+    {
+        return Some(include_bytes!(env!("MIDSTATE_CUDA_FATBIN")));
+    }
+    #[cfg(not(midstate_cuda_embedded))]
+    {
+        None
+    }
+}
+
 fn round_up(value: u32, multiple: u32) -> u32 {
     if multiple == 0 {
         return value;
@@ -265,9 +276,29 @@ fn launch_config(sm_count: i32) -> LaunchConfig {
     }
 }
 
+struct NvrtcApi {
+    _nvrtc: Library,
+    nvrtc_create_program: unsafe extern "C" fn(
+        *mut NvrtcProgram,
+        *const c_char,
+        *const c_char,
+        c_int,
+        *const *const c_char,
+        *const *const c_char,
+    ) -> NvrtcResult,
+    nvrtc_compile_program:
+        unsafe extern "C" fn(NvrtcProgram, c_int, *const *const c_char) -> NvrtcResult,
+    nvrtc_get_ptx_size: unsafe extern "C" fn(NvrtcProgram, *mut usize) -> NvrtcResult,
+    nvrtc_get_ptx: unsafe extern "C" fn(NvrtcProgram, *mut c_char) -> NvrtcResult,
+    nvrtc_get_program_log_size: unsafe extern "C" fn(NvrtcProgram, *mut usize) -> NvrtcResult,
+    nvrtc_get_program_log: unsafe extern "C" fn(NvrtcProgram, *mut c_char) -> NvrtcResult,
+    nvrtc_destroy_program: unsafe extern "C" fn(*mut NvrtcProgram) -> NvrtcResult,
+    nvrtc_get_error_string: unsafe extern "C" fn(NvrtcResult) -> *const c_char,
+}
+
 struct CudaApi {
     _cuda: Library,
-    _nvrtc: Library,
+    nvrtc: Option<NvrtcApi>,
     cu_init: unsafe extern "C" fn(c_uint) -> CuResult,
     cu_driver_get_version: unsafe extern "C" fn(*mut c_int) -> CuResult,
     cu_device_get_count: unsafe extern "C" fn(*mut c_int) -> CuResult,
@@ -306,22 +337,6 @@ struct CudaApi {
         *mut *mut c_void,
     ) -> CuResult,
     cu_get_error_string: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
-    nvrtc_create_program: unsafe extern "C" fn(
-        *mut NvrtcProgram,
-        *const c_char,
-        *const c_char,
-        c_int,
-        *const *const c_char,
-        *const *const c_char,
-    ) -> NvrtcResult,
-    nvrtc_compile_program:
-        unsafe extern "C" fn(NvrtcProgram, c_int, *const *const c_char) -> NvrtcResult,
-    nvrtc_get_ptx_size: unsafe extern "C" fn(NvrtcProgram, *mut usize) -> NvrtcResult,
-    nvrtc_get_ptx: unsafe extern "C" fn(NvrtcProgram, *mut c_char) -> NvrtcResult,
-    nvrtc_get_program_log_size: unsafe extern "C" fn(NvrtcProgram, *mut usize) -> NvrtcResult,
-    nvrtc_get_program_log: unsafe extern "C" fn(NvrtcProgram, *mut c_char) -> NvrtcResult,
-    nvrtc_destroy_program: unsafe extern "C" fn(*mut NvrtcProgram) -> NvrtcResult,
-    nvrtc_get_error_string: unsafe extern "C" fn(NvrtcResult) -> *const c_char,
 }
 
 unsafe impl Send for CudaApi {}
@@ -340,20 +355,11 @@ impl CudaApi {
 
     unsafe fn load_inner() -> Result<Self> {
         let cuda = load_library(&["libcuda.so.1", "libcuda.so", "nvcuda.dll"])?;
-        let nvrtc = load_library(&[
-            "libnvrtc.so",
-            "libnvrtc.so.13",
-            "libnvrtc.so.13.0",
-            "libnvrtc.so.12",
-            "libnvrtc.so.12.0",
-            "libnvrtc.so.11.2",
-            "/usr/local/cuda/lib64/libnvrtc.so",
-            "/usr/local/cuda/lib64/libnvrtc.so.13",
-            "/usr/local/cuda/lib64/libnvrtc.so.12",
-            "nvrtc64_130_0.dll",
-            "nvrtc64_120_0.dll",
-            "nvrtc64_112_0.dll",
-        ])?;
+        let nvrtc = if embedded_fatbin().is_some() {
+            None
+        } else {
+            Some(Self::load_nvrtc()?)
+        };
 
         let api = Self {
             cu_init: sym(&cuda, b"cuInit\0")?,
@@ -375,6 +381,29 @@ impl CudaApi {
             cu_memcpy_dtoh: sym_any(&cuda, &[b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0"])?,
             cu_launch_kernel: sym(&cuda, b"cuLaunchKernel\0")?,
             cu_get_error_string: sym(&cuda, b"cuGetErrorString\0")?,
+            _cuda: cuda,
+            nvrtc,
+        };
+        api.check_cuda((api.cu_init)(0), "cuInit")?;
+        Ok(api)
+    }
+
+    unsafe fn load_nvrtc() -> Result<NvrtcApi> {
+        let nvrtc = load_library(&[
+            "libnvrtc.so",
+            "libnvrtc.so.13",
+            "libnvrtc.so.13.0",
+            "libnvrtc.so.12",
+            "libnvrtc.so.12.0",
+            "libnvrtc.so.11.2",
+            "/usr/local/cuda/lib64/libnvrtc.so",
+            "/usr/local/cuda/lib64/libnvrtc.so.13",
+            "/usr/local/cuda/lib64/libnvrtc.so.12",
+            "nvrtc64_130_0.dll",
+            "nvrtc64_120_0.dll",
+            "nvrtc64_112_0.dll",
+        ])?;
+        Ok(NvrtcApi {
             nvrtc_create_program: sym(&nvrtc, b"nvrtcCreateProgram\0")?,
             nvrtc_compile_program: sym(&nvrtc, b"nvrtcCompileProgram\0")?,
             nvrtc_get_ptx_size: sym(&nvrtc, b"nvrtcGetPTXSize\0")?,
@@ -383,11 +412,8 @@ impl CudaApi {
             nvrtc_get_program_log: sym(&nvrtc, b"nvrtcGetProgramLog\0")?,
             nvrtc_destroy_program: sym(&nvrtc, b"nvrtcDestroyProgram\0")?,
             nvrtc_get_error_string: sym(&nvrtc, b"nvrtcGetErrorString\0")?,
-            _cuda: cuda,
             _nvrtc: nvrtc,
-        };
-        api.check_cuda((api.cu_init)(0), "cuInit")?;
-        Ok(api)
+        })
     }
 
     fn check_cuda(&self, code: CuResult, op: &str) -> Result<()> {
@@ -418,8 +444,11 @@ impl CudaApi {
     }
 
     fn nvrtc_error(&self, code: NvrtcResult) -> String {
+        let Some(nvrtc) = self.nvrtc.as_ref() else {
+            return format!("NVRTC error {code}");
+        };
         unsafe {
-            let ptr = (self.nvrtc_get_error_string)(code);
+            let ptr = (nvrtc.nvrtc_get_error_string)(code);
             if ptr.is_null() {
                 format!("NVRTC error {code}")
             } else {
@@ -538,12 +567,16 @@ impl CudaApi {
     }
 
     fn compile_ptx_once(&self, source: &str, arch: &str) -> Result<Vec<u8>> {
+        let nvrtc = self
+            .nvrtc
+            .as_ref()
+            .ok_or_else(|| anyhow!("NVRTC is unavailable and no embedded CUDA fatbin matched"))?;
         unsafe {
             let source = CString::new(source)?;
             let name = CString::new("midstate_cuda_miner.cu")?;
             let mut program = ptr::null_mut();
             self.check_nvrtc(
-                (self.nvrtc_create_program)(
+                (nvrtc.nvrtc_create_program)(
                     &mut program,
                     source.as_ptr(),
                     name.as_ptr(),
@@ -558,10 +591,10 @@ impl CudaApi {
             let opt_arch = CString::new(format!("--gpu-architecture={arch}"))?;
             let options = [opt_std.as_ptr(), opt_arch.as_ptr()];
             let compile_result =
-                (self.nvrtc_compile_program)(program, options.len() as c_int, options.as_ptr());
+                (nvrtc.nvrtc_compile_program)(program, options.len() as c_int, options.as_ptr());
             if compile_result != NVRTC_SUCCESS {
                 let log = self.program_log(program);
-                let _ = (self.nvrtc_destroy_program)(&mut program);
+                let _ = (nvrtc.nvrtc_destroy_program)(&mut program);
                 bail!(
                     "nvrtcCompileProgram failed for {arch}: {}{}",
                     self.nvrtc_error(compile_result),
@@ -575,16 +608,16 @@ impl CudaApi {
 
             let mut ptx_size = 0usize;
             self.check_nvrtc(
-                (self.nvrtc_get_ptx_size)(program, &mut ptx_size),
+                (nvrtc.nvrtc_get_ptx_size)(program, &mut ptx_size),
                 "nvrtcGetPTXSize",
             )?;
             let mut ptx = vec![0u8; ptx_size];
             self.check_nvrtc(
-                (self.nvrtc_get_ptx)(program, ptx.as_mut_ptr().cast::<c_char>()),
+                (nvrtc.nvrtc_get_ptx)(program, ptx.as_mut_ptr().cast::<c_char>()),
                 "nvrtcGetPTX",
             )?;
             self.check_nvrtc(
-                (self.nvrtc_destroy_program)(&mut program),
+                (nvrtc.nvrtc_destroy_program)(&mut program),
                 "nvrtcDestroyProgram",
             )?;
             Ok(ptx)
@@ -592,15 +625,18 @@ impl CudaApi {
     }
 
     fn program_log(&self, program: NvrtcProgram) -> String {
+        let Some(nvrtc) = self.nvrtc.as_ref() else {
+            return String::new();
+        };
         unsafe {
             let mut log_size = 0usize;
-            if (self.nvrtc_get_program_log_size)(program, &mut log_size) != NVRTC_SUCCESS
+            if (nvrtc.nvrtc_get_program_log_size)(program, &mut log_size) != NVRTC_SUCCESS
                 || log_size == 0
             {
                 return String::new();
             }
             let mut log = vec![0u8; log_size];
-            if (self.nvrtc_get_program_log)(program, log.as_mut_ptr().cast::<c_char>())
+            if (nvrtc.nvrtc_get_program_log)(program, log.as_mut_ptr().cast::<c_char>())
                 != NVRTC_SUCCESS
             {
                 return String::new();
@@ -678,19 +714,28 @@ impl CudaMiner {
             api.check_cuda((api.cu_ctx_create)(&mut ctx, 0, dev), "cuCtxCreate")?;
             api.check_cuda((api.cu_ctx_set_current)(ctx), "cuCtxSetCurrent")?;
 
-            let ptx = match api.compile_ptx(cuda_source(), major, minor) {
-                Ok(ptx) => ptx,
-                Err(e) => {
-                    let _ = (api.cu_ctx_destroy)(ctx);
-                    return Err(e);
+            let embedded = embedded_fatbin();
+            let ptx = if embedded.is_none() {
+                match api.compile_ptx(cuda_source(), major, minor) {
+                    Ok(ptx) => Some(ptx),
+                    Err(e) => {
+                        let _ = (api.cu_ctx_destroy)(ctx);
+                        return Err(e);
+                    }
                 }
+            } else {
+                None
             };
+            let module_data = embedded.unwrap_or_else(|| ptx.as_deref().unwrap());
+            if embedded.is_some() {
+                tracing::info!("loading embedded CUDA fatbin");
+            }
 
             let mut module = ptr::null_mut();
             api.check_cuda(
                 (api.cu_module_load_data_ex)(
                     &mut module,
-                    ptx.as_ptr().cast::<c_void>(),
+                    module_data.as_ptr().cast::<c_void>(),
                     0,
                     ptr::null_mut(),
                     ptr::null_mut(),
