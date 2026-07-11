@@ -1090,8 +1090,8 @@ impl CudaMiner {
             let mut it = hits.into_iter();
             let first = it.next().unwrap();
             match &first {
-                MiningResult::Block(e) => tracing::warn!(
-                    "CUDA found valid block! nonce={} hash={} gpu={}",
+                MiningResult::Block(e) => tracing::debug!(
+                    "CUDA found block candidate! nonce={} hash={} gpu={}",
                     e.nonce,
                     hex::encode(e.final_hash),
                     self.adapter_name

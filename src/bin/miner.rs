@@ -57,7 +57,7 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let default_filter = if cli.dashboard_only {
-        "midstate=warn,tower_http=warn"
+        "midstate=error,tower_http=error"
     } else {
         "midstate=info,tower_http=debug"
     };

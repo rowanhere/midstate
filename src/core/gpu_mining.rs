@@ -943,8 +943,8 @@ impl GpuMiner {
             let mut it = hits.into_iter();
             let first = it.next().unwrap();
             match &first {
-                MiningResult::Block(e) => tracing::warn!(
-                    "GPU found valid block! nonce={} hash={} gpu={}",
+                MiningResult::Block(e) => tracing::debug!(
+                    "GPU found block candidate! nonce={} hash={} gpu={}",
                     e.nonce, hex::encode(e.final_hash), self.adapter_name),
                 MiningResult::Share(e) => tracing::debug!(
                     "GPU found valid pool share! nonce={} hash={}",

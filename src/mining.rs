@@ -232,6 +232,42 @@ fn normalize_audit_base_url(audit_url: &str) -> String {
     }
 }
 
+fn default_share_target() -> [u8; 32] {
+    let mut target = [0xff; 32];
+    target[0] = 0x00;
+    target[1] = 0x0f;
+    target
+}
+
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(s, &mut out).ok()?;
+    Some(out)
+}
+
+async fn fetch_pool_targets(
+    client: &reqwest::Client,
+    audit_base_url: &str,
+) -> Option<([u8; 32], [u8; 32])> {
+    let stats = client
+        .get(format!("{}/pool/stats", audit_base_url))
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let network_target = stats
+        .get("network_target")
+        .and_then(|v| v.as_str())
+        .and_then(decode_hex32)?;
+    let share_target = stats
+        .get("share_target")
+        .and_then(|v| v.as_str())
+        .and_then(decode_hex32)?;
+    Some((network_target, share_target))
+}
+
 pub fn spawn_stratum_dashboard(
     hash_counter: Arc<AtomicU64>,
     stats: Arc<std::sync::RwLock<StratumStats>>,
@@ -256,12 +292,7 @@ pub fn spawn_stratum_dashboard(
             std::collections::BTreeMap::new();
 
         // Hardcoded share target matching the current pool server (0x000f...).
-        let share_target = {
-            let mut t = [0xff; 32];
-            t[0] = 0x00;
-            t[1] = 0x0f;
-            t
-        };
+        let share_target = default_share_target();
 
         fn u256_to_f64(u: primitive_types::U256) -> f64 {
             u.0[0] as f64
@@ -501,9 +532,6 @@ pub async fn run_stratum_client_with_options(
             // Create a fresh channel for shares on each successful connection
             let (share_tx, mut share_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(100);
 
-            let mut s_target = [0xff; 32];
-            s_target[0] = 0x00; s_target[1] = 0x0f;
-
             loop {
                 tokio::select! {
                     res = reader.read_line(&mut line) => {
@@ -528,7 +556,29 @@ pub async fn run_stratum_client_with_options(
                                 }
                             };
                             let header = batch.header();
-                            let n_target = batch.target; 
+                            let mut n_target = params
+                                .get(3)
+                                .and_then(|v| v.as_str())
+                                .and_then(decode_hex32)
+                                .unwrap_or(batch.target);
+                            let mut s_target = params
+                                .get(4)
+                                .and_then(|v| v.as_str())
+                                .and_then(decode_hex32)
+                                .unwrap_or_else(default_share_target);
+
+                            if params.get(3).is_none() || params.get(4).is_none() {
+                                if let Some((network_target, share_target)) =
+                                    fetch_pool_targets(&http_client, &audit_base_url).await
+                                {
+                                    n_target = network_target;
+                                    s_target = share_target;
+                                } else {
+                                    tracing::warn!(
+                                        "pool notify omitted explicit targets and audit stats were unavailable; falling back to template target"
+                                    );
+                                }
+                            }
                             {
                                 let mut s = stats.write().unwrap();
                                 s.network_target = n_target;
@@ -637,7 +687,11 @@ pub async fn run_stratum_client_with_options(
                             tracing::debug!("share accepted");
                             stats.write().unwrap().accepted_shares += 1; 
                         } else if let Some(err) = msg["error"].as_str() {
-                            tracing::warn!("share rejected: {}", err);
+                            if err == "Low difficulty" {
+                                tracing::debug!("share rejected: {}", err);
+                            } else {
+                                tracing::warn!("share rejected: {}", err);
+                            }
                             stats.write().unwrap().rejected_shares += 1; 
                         }
                     }
