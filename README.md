@@ -178,6 +178,27 @@ If your audit API is not on the default paired port, pass it explicitly:
   --worker rig1
 ```
 
+For Clore-style forwarded ports where container `3333` is public as
+`n1.de.clorecloud.net:2606` and container `8888` is exposed as HTTPS, start the
+pool with an explicit audit bind:
+
+```bash
+./target/release/midstate pool \
+  --pool-address <POOL_MSS_ADDRESS> \
+  --bind-addr 0.0.0.0:3333 \
+  --audit-bind-addr 0.0.0.0:8888
+```
+
+Then point the remote miner at the forwarded Stratum port and HTTPS audit URL:
+
+```bash
+./target/release/miner \
+  --pool-url stratum+tcp://n1.de.clorecloud.net:2606 \
+  --audit-url https://tgq7btzq1bf4a.clorecloud.net \
+  --address <MINER_MSS_PAYOUT_ADDRESS> \
+  --worker rig1
+```
+
 ## CLI Reference
 
 **Node**

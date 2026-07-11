@@ -465,9 +465,10 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
 /// * `pool_address` - The Midstate address where the pool fee will be sent.
 /// * `bind_addr` - The `IP:PORT` to bind the Stratum TCP server to (e.g., `0.0.0.0:3333`).
 ///                 The HTTP Audit API will automatically bind to an offset port (e.g., `8081`).
+/// * `audit_bind_addr` - Optional exact `IP:PORT` for the HTTP Audit API/dashboard.
 /// * `node_rpc_url` - The HTTP URL of the backend Midstate node (e.g., `http://10.0.0.5:8545`).
 /// * `pool_fee_percent` - The percentage of the block reward taken by the pool (e.g., 1.0).
-pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_url: String, pool_fee_percent: f64) {
+pub async fn run_stratum_pool(pool_address: String, bind_addr: String, audit_bind_addr: Option<String>, node_rpc_url: String, pool_fee_percent: f64) {
     tracing::info!("starting stratum pool server");
     
     std::fs::create_dir_all("data").unwrap();
@@ -519,18 +520,24 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
     let (api_listener, stratum_listener) = loop {
         let current_stratum = base_stratum_port + offset;
         let current_api = 8081 + offset;
+        let current_api_addr = audit_bind_addr
+            .clone()
+            .unwrap_or_else(|| format!("0.0.0.0:{}", current_api));
 
-        let a_res = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", current_api)).await;
+        let a_res = tokio::net::TcpListener::bind(&current_api_addr).await;
         let s_res = tokio::net::TcpListener::bind(format!("{}:{}", host, current_stratum)).await;
 
         match (a_res, s_res) {
             (Ok(a), Ok(s)) => {
-                tracing::info!("audit api bound to 0.0.0.0:{}", current_api);
+                tracing::info!("audit api bound to {}", current_api_addr);
                 tracing::info!("stratum pool bound to {}:{}", host, current_stratum);
                 break (a, s);
             }
             _ => {
-                tracing::warn!("port pair {}/{} in use. trying next pair...", current_stratum, current_api);
+                tracing::warn!("port pair {}/{} in use. trying next pair...", current_stratum, current_api_addr);
+                if audit_bind_addr.is_some() {
+                    panic!("fatal: configured stratum/audit bind address pair is unavailable: {}:{} / {}", host, current_stratum, current_api_addr);
+                }
                 offset += 1;
                 if offset > 10 {
                     panic!("fatal: could not find available stratum/api port pairs");
