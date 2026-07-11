@@ -36,12 +36,13 @@ const MAX_WINNERS: u32 = 256;
 const WINNERS_WORDS: usize = 4 + (MAX_WINNERS as usize) * 3;
 const WINNERS_BYTES: usize = WINNERS_WORDS * 4;
 const SELFTEST_N: u32 = 8;
-const THREADS_PER_BLOCK: u32 = 64;
-const DEFAULT_BATCH_NONCES: u32 = 1 << 13;
+const DEFAULT_BATCH_NONCES: u32 = 0;
+const DEFAULT_THREADS_PER_BLOCK: u32 = 0;
 const DEFAULT_ITERS_PER_DISPATCH: u32 = 2_000;
 const DEFAULT_RESPONSIVE_ITERS: u32 = 384;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -114,30 +115,45 @@ pub fn cuda_dashboard_snapshot() -> Vec<CudaDashboardStat> {
 #[serde(default)]
 struct CudaSettings {
     batch_nonces: u32,
+    threads_per_block: u32,
     iters_per_dispatch: u32,
     responsive_iters: u32,
     duty: f32,
+    auto_tune: bool,
 }
 
 impl Default for CudaSettings {
     fn default() -> Self {
         Self {
             batch_nonces: DEFAULT_BATCH_NONCES,
+            threads_per_block: DEFAULT_THREADS_PER_BLOCK,
             iters_per_dispatch: DEFAULT_ITERS_PER_DISPATCH,
             responsive_iters: DEFAULT_RESPONSIVE_ITERS,
             duty: 1.0,
+            auto_tune: true,
         }
     }
 }
 
 impl CudaSettings {
     fn sanitized(mut self) -> Self {
-        self.batch_nonces = self.batch_nonces.clamp(64, 1 << 24);
+        if self.batch_nonces != 0 {
+            self.batch_nonces = self.batch_nonces.clamp(64, 1 << 24);
+        }
+        if self.threads_per_block != 0 {
+            self.threads_per_block = self.threads_per_block.clamp(32, 1024);
+        }
         self.iters_per_dispatch = self.iters_per_dispatch.max(1);
         self.responsive_iters = self.responsive_iters.max(1);
         self.duty = self.duty.clamp(0.02, 1.0);
         self
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LaunchConfig {
+    batch_nonces: u32,
+    threads_per_block: u32,
 }
 
 fn settings() -> &'static CudaSettings {
@@ -164,9 +180,20 @@ fn settings() -> &'static CudaSettings {
 
 static CUDA_DUTY_MILLI: AtomicU32 = AtomicU32::new(0);
 static CUDA_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+static CUDA_BATCH_OVERRIDE: AtomicU32 = AtomicU32::new(u32::MAX);
+static CUDA_TPB_OVERRIDE: AtomicU32 = AtomicU32::new(u32::MAX);
 
 pub fn set_cuda_duty(duty: f32) {
     CUDA_DUTY_MILLI.store((duty.clamp(0.02, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+}
+
+pub fn set_cuda_launch_overrides(batch_nonces: Option<u32>, threads_per_block: Option<u32>) {
+    if let Some(batch_nonces) = batch_nonces {
+        CUDA_BATCH_OVERRIDE.store(batch_nonces, Ordering::Relaxed);
+    }
+    if let Some(threads_per_block) = threads_per_block {
+        CUDA_TPB_OVERRIDE.store(threads_per_block, Ordering::Relaxed);
+    }
 }
 
 fn cuda_duty() -> f32 {
@@ -180,6 +207,62 @@ fn cuda_duty() -> f32 {
         return milli as f32 / 1000.0;
     }
     settings().duty
+}
+
+fn round_up(value: u32, multiple: u32) -> u32 {
+    if multiple == 0 {
+        return value;
+    }
+    value.div_ceil(multiple) * multiple
+}
+
+fn launch_config(sm_count: i32) -> LaunchConfig {
+    let s = settings();
+    let tpb_override = CUDA_TPB_OVERRIDE.load(Ordering::Relaxed);
+    let configured_tpb = if tpb_override != u32::MAX {
+        tpb_override
+    } else {
+        s.threads_per_block
+    };
+    let threads_per_block = if configured_tpb == 0 {
+        256
+    } else {
+        configured_tpb.clamp(32, 1024)
+    }
+    .next_power_of_two()
+    .clamp(32, 1024);
+
+    let sm = sm_count.max(1) as u32;
+    let auto_batch = if s.auto_tune {
+        // Four resident blocks per SM keeps large Blackwell cards fed while
+        // keeping batch latency comfortably below normal pool job intervals.
+        let blocks_per_sm = 4u32;
+        let sm_scaled = sm
+            .saturating_mul(blocks_per_sm)
+            .saturating_mul(threads_per_block);
+        let floor = 16_384u32;
+        let rounded = round_up(sm_scaled.max(floor), threads_per_block);
+        rounded.clamp(threads_per_block, 1 << 24)
+    } else {
+        16_384
+    };
+
+    let batch_override = CUDA_BATCH_OVERRIDE.load(Ordering::Relaxed);
+    let configured_batch = if batch_override != u32::MAX {
+        batch_override
+    } else {
+        s.batch_nonces
+    };
+    let batch_nonces = if configured_batch == 0 {
+        auto_batch
+    } else {
+        round_up(configured_batch, threads_per_block).clamp(threads_per_block, 1 << 24)
+    };
+
+    LaunchConfig {
+        batch_nonces,
+        threads_per_block,
+    }
 }
 
 struct CudaApi {
@@ -407,6 +490,21 @@ impl CudaApi {
         }
     }
 
+    fn multiprocessor_count(&self, dev: CuDevice) -> Result<i32> {
+        unsafe {
+            let mut count = 0;
+            self.check_cuda(
+                (self.cu_device_get_attribute)(
+                    &mut count,
+                    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    dev,
+                ),
+                "cuDeviceGetAttribute(sm_count)",
+            )?;
+            Ok(count)
+        }
+    }
+
     fn compile_ptx(&self, source: &str, major: i32, minor: i32) -> Result<Vec<u8>> {
         let mut candidates = vec![format!("compute_{major}{minor}")];
         for arch in [
@@ -554,6 +652,7 @@ pub struct CudaMiner {
     d_state: CuDevicePtr,
     d_winners: CuDevicePtr,
     adapter_name: String,
+    launch: LaunchConfig,
     state: Mutex<MinerState>,
     stats: Arc<CudaDeviceStats>,
 }
@@ -567,7 +666,13 @@ impl CudaMiner {
             let dev = api.device(ordinal)?;
             let adapter_name = api.device_name(dev)?;
             let (major, minor) = api.compute_capability(dev)?;
-            tracing::info!("CUDA adapter found: {adapter_name} [compute {major}.{minor}]");
+            let sm_count = api.multiprocessor_count(dev).unwrap_or(0);
+            let launch = launch_config(sm_count);
+            tracing::info!(
+                "CUDA adapter found: {adapter_name} [compute {major}.{minor}, SMs={sm_count}, batch={}, tpb={}]",
+                launch.batch_nonces,
+                launch.threads_per_block
+            );
 
             let mut ctx = ptr::null_mut();
             api.check_cuda((api.cu_ctx_create)(&mut ctx, 0, dev), "cuCtxCreate")?;
@@ -612,7 +717,7 @@ impl CudaMiner {
                 "cuModuleGetFunction(k_test)",
             )?;
 
-            let max_state_bytes = (settings().batch_nonces as usize) * 8 * 4;
+            let max_state_bytes = (launch.batch_nonces as usize) * 8 * 4;
             let mut d_params = 0;
             let mut d_state = 0;
             let mut d_winners = 0;
@@ -647,6 +752,7 @@ impl CudaMiner {
                 d_state,
                 d_winners,
                 adapter_name,
+                launch,
                 state: Mutex::new(MinerState {
                     job: None,
                     pending: VecDeque::new(),
@@ -664,8 +770,8 @@ impl CudaMiner {
         self.stats.clone()
     }
 
-    fn groups(n_nonces: u32) -> u32 {
-        (n_nonces + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK
+    fn groups(&self, n_nonces: u32) -> u32 {
+        (n_nonces + self.launch.threads_per_block - 1) / self.launch.threads_per_block
     }
 
     fn set_current(&self) -> Result<()> {
@@ -702,7 +808,7 @@ impl CudaMiner {
                     groups,
                     1,
                     1,
-                    THREADS_PER_BLOCK,
+                    self.launch.threads_per_block,
                     1,
                     1,
                     0,
@@ -731,7 +837,7 @@ impl CudaMiner {
                     groups,
                     1,
                     1,
-                    THREADS_PER_BLOCK,
+                    self.launch.threads_per_block,
                     1,
                     1,
                     0,
@@ -782,7 +888,7 @@ impl CudaMiner {
                 .ok()?;
         }
 
-        let groups = Self::groups(n_nonces);
+        let groups = self.groups(n_nonces);
         self.launch2(self.k_init, groups).ok()?;
         self.synchronize().ok()?;
 
@@ -885,7 +991,7 @@ impl CudaMiner {
             pool: pool_words,
             base_lo: 0,
             base_hi: 0,
-            n_nonces: settings().batch_nonces,
+            n_nonces: self.launch.batch_nonces,
             iters: 0,
             has_pool,
             pad0: 0,
@@ -903,7 +1009,7 @@ impl CudaMiner {
             let winners = self.run_batch(
                 &mut params,
                 base,
-                settings().batch_nonces,
+                self.launch.batch_nonces,
                 &cancel,
                 &hash_counter,
                 true,

@@ -36,6 +36,14 @@ struct Cli {
     #[arg(long = "gpu-duty")]
     gpu_duty: Option<f32>,
 
+    /// CUDA nonces per GPU batch. 0 = auto-size from GPU SM count.
+    #[arg(long = "cuda-wave")]
+    cuda_wave: Option<u32>,
+
+    /// CUDA threads per block. 0 = auto default.
+    #[arg(long = "cuda-tpb")]
+    cuda_tpb: Option<u32>,
+
     /// Print miner dashboard automatically every N seconds. 0 = only on ENTER.
     #[arg(long = "stats-interval", default_value_t = 0)]
     stats_interval: u64,
@@ -75,6 +83,9 @@ async fn main() -> Result<()> {
 
     if let Some(duty) = cli.gpu_duty {
         midstate::core::gpu_mining::set_gpu_duty(duty);
+    }
+    if cli.cuda_wave.is_some() || cli.cuda_tpb.is_some() {
+        midstate::core::cuda_mining::set_cuda_launch_overrides(cli.cuda_wave, cli.cuda_tpb);
     }
 
     let hash_counter = Arc::new(AtomicU64::new(0));

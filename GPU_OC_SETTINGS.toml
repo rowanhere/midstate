@@ -42,7 +42,14 @@
 #                   bigger cards)
 #   Quadro M6000 / mid-range discrete: 24576 saturates it and a batch still
 #   finishes in ~1.5-2 s — well inside typical pool intervals.
-batch_nonces = 24576
+batch_nonces = 0
+
+# CUDA threads per block. 0 = auto default. For RTX 5090/Blackwell, auto starts
+# at 256 threads per block and sizes the wave from the card's SM count.
+threads_per_block = 0
+
+# Enable CUDA auto wave sizing when batch_nonces = 0.
+auto_tune = true
 
 # ── iters_per_dispatch ───────────────────────────────────────────────────────
 # Chain steps issued per GPU dispatch. Higher = fewer host<->GPU round-trips
