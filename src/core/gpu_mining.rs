@@ -27,7 +27,9 @@ use super::types::{Extension, EXTENSION_ITERATIONS};
 use super::extension::{create_extension, mine_extension, MiningResult};
 use anyhow::{anyhow, bail, Result};
 use std::collections::VecDeque;
+use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::thread;
 use std::time::Instant;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -526,6 +528,68 @@ async fn pick_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
     Ok(adapters.into_iter().next().unwrap())
 }
 
+async fn pick_all_adapters(instance: &wgpu::Instance) -> Result<Vec<wgpu::Adapter>> {
+    let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+    if adapters.is_empty() {
+        bail!(
+            "no GPU adapters found. wgpu uses Vulkan/GL, not CUDA. NVIDIA cards \
+             need a working Vulkan ICD."
+        );
+    }
+
+    for a in &adapters {
+        let i = a.get_info();
+        tracing::info!("GPU adapter found: {} [{:?} via {:?}]", i.name, i.device_type, i.backend);
+    }
+
+    let name_pref = settings()
+        .adapter
+        .clone()
+        .or_else(|| std::env::var("WGPU_ADAPTER_NAME").ok())
+        .filter(|s| !s.trim().is_empty());
+    if let Some(want) = name_pref {
+        let want_lc = want.to_lowercase();
+        let matches: Vec<_> = adapters
+            .into_iter()
+            .filter(|a| a.get_info().name.to_lowercase().contains(&want_lc))
+            .collect();
+        if !matches.is_empty() {
+            return Ok(matches);
+        }
+        tracing::warn!("no GPU adapter matched name '{want}'; using automatic selection");
+        adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+    }
+
+    adapters.retain(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+    if adapters.is_empty() {
+        bail!("only software (CPU) GPU adapters available; using the CPU miner instead");
+    }
+
+    adapters.sort_by_key(|a| {
+        let i = a.get_info();
+        let type_rank = match i.device_type {
+            wgpu::DeviceType::DiscreteGpu => 0u8,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            wgpu::DeviceType::VirtualGpu => 2,
+            _ => 3,
+        };
+        let backend_rank = match i.backend {
+            wgpu::Backend::Vulkan => 0u8,
+            wgpu::Backend::Dx12 => 1,
+            wgpu::Backend::Metal => 2,
+            wgpu::Backend::Gl => 3,
+            _ => 4,
+        };
+        (type_rank, backend_rank)
+    });
+
+    let best_backend = adapters.first().unwrap().get_info().backend;
+    Ok(adapters
+        .into_iter()
+        .filter(|a| a.get_info().backend == best_backend)
+        .collect())
+}
+
 // ── The reusable GPU context ──────────────────────────────────────────────────
 
 /// Identifies a mining job. Surplus winners from one job must never be served to
@@ -576,6 +640,10 @@ impl GpuMiner {
         // pick deliberately (discrete > integrated, Vulkan > GL), honoring an
         // optional user override.
         let adapter = pick_adapter(&instance).await?;
+        Self::new_for_adapter(adapter).await
+    }
+
+    async fn new_for_adapter(adapter: wgpu::Adapter) -> Result<Self> {
         let info = adapter.get_info();
         tracing::info!(
             "GPU adapter selected: {} [{:?} via {:?}]",
@@ -934,6 +1002,134 @@ impl GpuMiner {
     }
 }
 
+pub struct GpuFarm {
+    miners: Vec<Arc<GpuMiner>>,
+    adapter_names: String,
+}
+
+impl GpuFarm {
+    pub fn new() -> Result<Self> {
+        pollster::block_on(Self::new_async())
+    }
+
+    async fn new_async() -> Result<Self> {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapters = pick_all_adapters(&instance).await?;
+        let mut miners = Vec::new();
+
+        for adapter in adapters {
+            let info = adapter.get_info();
+            match GpuMiner::new_for_adapter(adapter).await {
+                Ok(g) => match g.self_test() {
+                    Ok(()) => {
+                        tracing::info!("GPU mining enabled on {}", g.adapter_name());
+                        miners.push(Arc::new(g));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "GPU adapter {} disabled (self-test failed): {e}",
+                            info.name
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("GPU adapter {} disabled (init failed): {e}", info.name);
+                }
+            }
+        }
+
+        if miners.is_empty() {
+            bail!("no usable GPU adapters passed initialization and self-test");
+        }
+
+        let adapter_names = miners
+            .iter()
+            .map(|m| m.adapter_name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Ok(Self { miners, adapter_names })
+    }
+
+    pub fn len(&self) -> usize {
+        self.miners.len()
+    }
+
+    pub fn adapter_names(&self) -> &str {
+        &self.adapter_names
+    }
+
+    pub fn mine_gpu(
+        &self,
+        midstate: [u8; 32],
+        target: [u8; 32],
+        pool_target: Option<[u8; 32]>,
+        external_cancel: Arc<AtomicBool>,
+        hash_counter: Arc<AtomicU64>,
+    ) -> Option<MiningResult> {
+        if self.miners.len() == 1 {
+            return self.miners[0].mine_gpu(
+                midstate,
+                target,
+                pool_target,
+                external_cancel,
+                hash_counter,
+            );
+        }
+
+        let race_cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::with_capacity(self.miners.len() + 1);
+
+        {
+            let race_cancel = race_cancel.clone();
+            let external_cancel = external_cancel.clone();
+            handles.push(thread::spawn(move || {
+                while !race_cancel.load(Ordering::Relaxed)
+                    && !external_cancel.load(Ordering::Relaxed)
+                {
+                    thread::sleep(std::time::Duration::from_millis(25));
+                }
+                if external_cancel.load(Ordering::Relaxed) {
+                    race_cancel.store(true, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for miner in &self.miners {
+            let miner = miner.clone();
+            let tx = tx.clone();
+            let cancel = race_cancel.clone();
+            let hash_counter = hash_counter.clone();
+            handles.push(thread::spawn(move || {
+                let result = miner.mine_gpu(midstate, target, pool_target, cancel, hash_counter);
+                let _ = tx.send(result);
+            }));
+        }
+        drop(tx);
+
+        let mut found = None;
+        for _ in 0..self.miners.len() {
+            match rx.recv() {
+                Ok(Some(hit)) => {
+                    found = Some(hit);
+                    race_cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+
+        race_cancel.store(true, Ordering::Relaxed);
+        for handle in handles {
+            let _ = handle.join();
+        }
+        found
+    }
+}
+
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -954,25 +1150,23 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 /// Returns `None` when there's no GPU, the self-test failed, or
 /// `MINER_DISABLE_GPU` is set; in every such case the caller should fall back to
 /// its existing CPU miner. See the integration note for the call-site pattern.
-pub fn shared() -> Option<&'static GpuMiner> {
-    static SHARED: OnceLock<Option<GpuMiner>> = OnceLock::new();
+pub fn shared() -> Option<&'static GpuFarm> {
+    static SHARED: OnceLock<Option<GpuFarm>> = OnceLock::new();
     SHARED
         .get_or_init(|| {
             if std::env::var("MINER_DISABLE_GPU").map(|v| v != "0").unwrap_or(false) {
                 tracing::info!("GPU mining disabled via MINER_DISABLE_GPU");
                 return None;
             }
-            match GpuMiner::new() {
-                Ok(g) => match g.self_test() {
-                    Ok(()) => {
-                        tracing::info!("GPU mining enabled on {}", g.adapter_name());
-                        Some(g)
-                    }
-                    Err(e) => {
-                        tracing::warn!("GPU mining disabled (self-test failed): {e}");
-                        None
-                    }
-                },
+            match GpuFarm::new() {
+                Ok(farm) => {
+                    tracing::info!(
+                        "GPU mining enabled on {} adapter(s): {}",
+                        farm.len(),
+                        farm.adapter_names()
+                    );
+                    Some(farm)
+                }
                 Err(e) => {
                     tracing::info!("GPU mining disabled (no usable device): {e}");
                     None

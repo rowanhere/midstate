@@ -18,6 +18,7 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Default, Clone)]
 pub struct StratumStats {
@@ -40,6 +41,14 @@ pub struct MiningConfig {
     /// Optional rig name reported to the pool in mining.authorize for the per-worker
     /// breakdown. Absent in older miner.toml files -> deserializes to None -> "default".
     pub worker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StratumClientOptions {
+    pub pool_url: String,
+    pub payout_address: String,
+    pub worker: String,
+    pub audit_url: Option<String>,
 }
 
 pub enum MinedResult {
@@ -190,17 +199,20 @@ impl MiningCoordinator {
     }
 }
 
-pub async fn run_stratum_client(
-    pool_url: String, 
-    payout_address: String,
-    worker: String,
-    threads: usize,
-    hash_counter: Arc<AtomicU64>,
-    stats: Arc<std::sync::RwLock<StratumStats>> 
-) {
-    let host = pool_url.replace("stratum+tcp://", "");
-    
-    let mut api_host = host.clone();
+fn normalize_pool_host(pool_url: &str) -> String {
+    pool_url
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("stratum+tcp://")
+        .or_else(|| pool_url.trim().trim_end_matches('/').strip_prefix("tcp://"))
+        .or_else(|| pool_url.trim().trim_end_matches('/').strip_prefix("http://"))
+        .or_else(|| pool_url.trim().trim_end_matches('/').strip_prefix("https://"))
+        .unwrap_or_else(|| pool_url.trim().trim_end_matches('/'))
+        .to_string()
+}
+
+fn default_audit_base_url(host: &str) -> String {
+    let mut api_host = host.to_string();
     if let Some((ip, port_str)) = host.rsplit_once(':') {
         if let Ok(port) = port_str.parse::<u16>() {
             let offset = port.saturating_sub(3333);
@@ -208,23 +220,197 @@ pub async fn run_stratum_client(
             api_host = format!("{}:{}", ip, api_port);
         }
     }
-    
+    format!("http://{}", api_host)
+}
+
+fn normalize_audit_base_url(audit_url: &str) -> String {
+    let trimmed = audit_url.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    }
+}
+
+pub fn spawn_stratum_dashboard(
+    hash_counter: Arc<AtomicU64>,
+    stats: Arc<std::sync::RwLock<StratumStats>>,
+) {
+    let hc = hash_counter.clone();
+    let stats_clone = stats.clone();
+
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let mut line = String::new();
+        let mut last_hashes = 0;
+        let mut last_time = Instant::now();
+
+        // Hardcoded share target matching the current pool server (0x000f...).
+        let share_target = {
+            let mut t = [0xff; 32];
+            t[0] = 0x00;
+            t[1] = 0x0f;
+            t
+        };
+
+        fn u256_to_f64(u: primitive_types::U256) -> f64 {
+            u.0[0] as f64
+                + (u.0[1] as f64) * 2.0f64.powi(64)
+                + (u.0[2] as f64) * 2.0f64.powi(128)
+                + (u.0[3] as f64) * 2.0f64.powi(192)
+        }
+
+        fn format_time(secs: f64) -> String {
+            if secs < 60.0 {
+                return format!("{:.0}s", secs);
+            }
+            if secs < 3600.0 {
+                return format!("{:.0}m {:.0}s", secs / 60.0, secs % 60.0);
+            }
+            if secs < 86400.0 {
+                return format!("{:.0}h {:.0}m", secs / 3600.0, (secs % 3600.0) / 60.0);
+            }
+            if secs < 31536000.0 {
+                return format!("{:.0}d {:.0}h", secs / 86400.0, (secs % 86400.0) / 3600.0);
+            }
+            format!("{:.1} years", secs / 31536000.0)
+        }
+
+        let share_target_f64 = u256_to_f64(primitive_types::U256::from_big_endian(&share_target));
+
+        loop {
+            line.clear();
+            if stdin.read_line(&mut line).await.unwrap_or(0) == 0 {
+                break;
+            }
+
+            let current = hc.load(Ordering::Relaxed);
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_time).as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                (current - last_hashes) as f64 / elapsed
+            } else {
+                0.0
+            };
+
+            println!("\n== MINER STATUS ==");
+            println!("Hashrate:      {:.2} nonces/s", rate);
+
+            let s = stats_clone.read().unwrap().clone();
+            if s.network_target != [0u8; 32] {
+                let target_f64 = u256_to_f64(primitive_types::U256::from_big_endian(&s.network_target));
+
+                let expected_nonces = 2.0f64.powi(256) / target_f64.max(1.0);
+                let network_nps = expected_nonces / 60.0;
+                let share_pct = if network_nps > 0.0 {
+                    (rate / network_nps) * 100.0
+                } else {
+                    0.0
+                };
+
+                let expected_shares_per_block = share_target_f64 / target_f64.max(1.0);
+                let session_effort_pct = if expected_shares_per_block > 0.0 {
+                    (s.accepted_shares as f64 / expected_shares_per_block) * 100.0
+                } else {
+                    0.0
+                };
+
+                println!("Network:       {:.2} nonces/s", network_nps);
+
+                if share_pct < 0.001 {
+                    println!("Your Share:    < 0.001%");
+                } else {
+                    println!("Your Share:    {:.4}%", share_pct);
+                }
+
+                if rate > 0.0 {
+                    println!("Solo ETA:      {}", format_time(expected_nonces / rate));
+                } else {
+                    println!("Solo ETA:      ---");
+                }
+                println!("----------------------------------------");
+                println!("Shares:        {} acc / {} rej", s.accepted_shares, s.rejected_shares);
+                println!("Expected:      1 block per {} shares", expected_shares_per_block.round() as u64);
+                println!(
+                    "Session Luck:  {:.2}% {}",
+                    session_effort_pct,
+                    if session_effort_pct >= 100.0 {
+                        "due for a block"
+                    } else {
+                        "in progress"
+                    }
+                );
+            } else {
+                println!("Network:       Waiting for job...");
+            }
+
+            println!("========================================\n");
+
+            last_hashes = current;
+            last_time = now;
+        }
+    });
+}
+
+pub async fn run_stratum_client(
+    pool_url: String,
+    payout_address: String,
+    worker: String,
+    threads: usize,
+    hash_counter: Arc<AtomicU64>,
+    stats: Arc<std::sync::RwLock<StratumStats>>,
+) {
+    run_stratum_client_with_options(
+        StratumClientOptions {
+            pool_url,
+            payout_address,
+            worker,
+            audit_url: None,
+        },
+        threads,
+        hash_counter,
+        stats,
+    )
+    .await;
+}
+
+pub async fn run_stratum_client_with_options(
+    opts: StratumClientOptions,
+    threads: usize,
+    hash_counter: Arc<AtomicU64>,
+    stats: Arc<std::sync::RwLock<StratumStats>>,
+) {
+    let host = normalize_pool_host(&opts.pool_url);
+    let audit_base_url = opts
+        .audit_url
+        .as_deref()
+        .map(normalize_audit_base_url)
+        .unwrap_or_else(|| default_audit_base_url(&host));
+
     let http_client = reqwest::Client::new();
-    
+
     // Declare the mutable cancel flag outside so it persists across reconnects
     let mut mining_cancel = Arc::new(AtomicBool::new(false));
 
     loop {
         // Kill any lingering threads before attempting to reconnect
         mining_cancel.store(true, Ordering::Relaxed);
-        
-        tracing::info!("stratum client connecting to {} (api: {})", host, api_host);
+
+        tracing::info!(
+            "stratum client connecting to {} (audit: {})",
+            host,
+            audit_base_url
+        );
         if let Ok(mut stream) = TcpStream::connect(&host).await {
             let (read_half, mut write_half) = stream.split();
             let mut reader = BufReader::new(read_half);
 
             let auth_req = serde_json::json!({
-                "id": 1, "method": "mining.authorize", "params": [payout_address.clone(), worker.clone()]
+                "id": 1,
+                "method": "mining.authorize",
+                "params": [opts.payout_address.clone(), opts.worker.clone()]
             });
             let _ = write_half.write_all(format!("{}\n", auth_req).as_bytes()).await;
 
@@ -276,11 +462,18 @@ pub async fn run_stratum_client(
                             if let Some(pool_cb) = batch.coinbase.first() {
                                 let claimed_root = hex::encode(pool_cb.salt);
                                 
-                                if let Ok(res) = http_client.get(format!("http://{}/api/proof?address={}", api_host, payout_address)).send().await {
+                                if let Ok(res) = http_client
+                                    .get(format!(
+                                        "{}/api/proof?address={}",
+                                        audit_base_url, opts.payout_address
+                                    ))
+                                    .send()
+                                    .await
+                                {
                                     if let Ok(proof_data) = res.json::<serde_json::Value>().await {
                                         if proof_data.get("error").is_none() {
                                             
-                                            let payout_bytes = crate::core::types::parse_address_flexible(&payout_address).unwrap();
+                                            let payout_bytes = crate::core::types::parse_address_flexible(&opts.payout_address).unwrap();
                                             let score = proof_data["score"].as_u64().unwrap_or(0);
                                             let mut data = [0u8; 40];
                                             data[0..32].copy_from_slice(&payout_bytes);
@@ -318,8 +511,12 @@ pub async fn run_stratum_client(
                                                     break;
                                                 }
                                             }
+                                        } else if let Some(err) = proof_data.get("error").and_then(|v| v.as_str()) {
+                                            tracing::warn!("audit proof unavailable: {}", err);
                                         }
                                     }
+                                } else {
+                                    tracing::warn!("failed to fetch audit proof from {}", audit_base_url);
                                 }
                             }
                            tracing::info!("audit passed. starting job {}", job_id);
@@ -365,7 +562,9 @@ pub async fn run_stratum_client(
                     }
                     Some((job_id, nonce)) = share_rx.recv() => {
                         let submit_req = serde_json::json!({
-                            "id": 2, "method": "mining.submit", "params": [payout_address.clone(), job_id, nonce]
+                            "id": 2,
+                            "method": "mining.submit",
+                            "params": [opts.payout_address.clone(), job_id, nonce]
                         });
                         let _ = write_half.write_all(format!("{}\n", submit_req).as_bytes()).await;
                     }

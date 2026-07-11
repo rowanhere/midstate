@@ -13,6 +13,14 @@ cargo build --release
 
 The binary is output to `./target/release/midstate`.
 
+Build the standalone no-sync Stratum miner for a GPU rig:
+
+```bash
+cargo build --release --bin miner
+```
+
+The miner binary is output to `./target/release/miner`.
+
 ## 2. Node Operations
 
 Nodes maintain the state accumulator, manage libp2p networking, and execute mining.
@@ -135,6 +143,39 @@ A solo mining node writes its deterministic coinbase seeds to a local log file. 
 ```bash
 midstate wallet import-rewards --path wallet.dat --coinbase-file ./data/coinbase_seeds.jsonl
 
+```
+
+## 8. Pool Mining With A Remote GPU Rig
+
+On machine A, run a synced node and start the Stratum pool. The pool address must be an MSS address.
+
+```bash
+./target/release/midstate node --rpc-bind 0.0.0.0 --rpc-port 8545
+./target/release/midstate pool --pool-address <POOL_MSS_ADDRESS>
+```
+
+By default, Stratum listens on `3333` and the audit API listens on `8081`.
+
+On machine B, build and run the standalone miner. The payout address must also be an MSS address.
+
+```bash
+cargo build --release --bin miner
+./target/release/miner \
+  --pool-url stratum+tcp://<MACHINE_A_IP>:3333 \
+  --address <MINER_MSS_PAYOUT_ADDRESS> \
+  --worker rig1
+```
+
+The standalone miner does not need a local node or chain sync. It uses every usable GPU adapter detected by `wgpu` on the best available backend, and it CPU-verifies every surfaced share before submission.
+
+If your audit API is not on the default paired port, pass it explicitly:
+
+```bash
+./target/release/miner \
+  --pool-url stratum+tcp://<MACHINE_A_IP>:2606 \
+  --audit-url http://<MACHINE_A_IP>:8081 \
+  --address <MINER_MSS_PAYOUT_ADDRESS> \
+  --worker rig1
 ```
 
 ## CLI Reference
