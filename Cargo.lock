@@ -2824,6 +2824,7 @@ dependencies = [
  "hex",
  "im",
  "lazy_static",
+ "libloading",
  "libp2p",
  "libp2p-core",
  "libp2p-stream",

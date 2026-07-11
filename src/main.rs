@@ -133,7 +133,7 @@ enum Command {
         #[arg(long)] 
         threads: Option<usize>,
         
-         /// Mining backend: "auto" (default, prefer GPU), "gpu", or "cpu".
+         /// Mining backend: "auto" (default, prefer CUDA then GPU), "cuda", "gpu", or "cpu".
         #[arg(long, default_value = "auto")]
         backend: String,
         
@@ -679,6 +679,7 @@ async fn main() -> Result<()> {
         Command::Node { data_dir, port, rpc_port, rpc_bind, peer, mine, threads,
                 verify_threads, listen, config, prune, license_wallet, backend } => {
                     midstate::core::gpu_mining::set_backend(match backend.to_ascii_lowercase().as_str() {
+                        "cuda" => midstate::core::gpu_mining::Backend::Cuda,
                         "gpu"  => midstate::core::gpu_mining::Backend::Gpu,
                         "cpu"  => midstate::core::gpu_mining::Backend::Cpu,
                         "auto" => midstate::core::gpu_mining::Backend::Auto,

@@ -131,6 +131,7 @@ static GPU_DUTY_MILLI: AtomicU32 = AtomicU32::new(0);
 /// (e.g. from a `--gpu-duty` flag); overrides the TOML `duty`.
 pub fn set_gpu_duty(duty: f32) {
     GPU_DUTY_MILLI.store((duty.clamp(0.02, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+    super::cuda_mining::set_cuda_duty(duty);
 }
 
 /// Current duty cycle. Precedence: `GPU_MINE_DUTY` env (live, no rebuild) >
@@ -1183,8 +1184,9 @@ pub fn gpu_available() -> bool {
 
 /// Which mining backend `mine()` should use.
 ///
-/// - `Auto` (default): prefer the GPU, silently fall back to CPU if none is usable.
-/// - `Gpu`: prefer the GPU; if it genuinely can't initialize, warn and use CPU
+/// - `Auto` (default): prefer CUDA, then wgpu, then CPU.
+/// - `Cuda`: prefer native NVIDIA CUDA; if unavailable, warn and use CPU.
+/// - `Gpu`: prefer the wgpu/Vulkan/DX/Metal backend; if unavailable, warn and use CPU
 ///   (mining on a broken GPU is never worth producing rejected blocks).
 /// - `Cpu`: always use the multithreaded CPU miner.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -1193,6 +1195,7 @@ pub enum Backend {
     Auto = 0,
     Gpu = 1,
     Cpu = 2,
+    Cuda = 3,
 }
 
 static BACKEND: AtomicU8 = AtomicU8::new(Backend::Auto as u8);
@@ -1209,6 +1212,7 @@ pub fn backend() -> Backend {
     match BACKEND.load(Ordering::Relaxed) {
         1 => Backend::Gpu,
         2 => Backend::Cpu,
+        3 => Backend::Cuda,
         _ => Backend::Auto,
     }
 }
@@ -1236,13 +1240,31 @@ pub fn mine(
     cancel: Arc<AtomicBool>,
     hash_counter: Arc<AtomicU64>,
 ) -> Option<MiningResult> {
-    let want_gpu = backend() != Backend::Cpu;
-    if want_gpu {
-        if let Some(g) = shared() {
-            return g.mine_gpu(midstate, target, pool_target, cancel, hash_counter);
+    match backend() {
+        Backend::Cpu => {}
+        Backend::Cuda => {
+            return super::cuda_mining::mine_cuda_or_cpu(
+                midstate,
+                target,
+                pool_target,
+                threads,
+                cancel,
+                hash_counter,
+            );
         }
-        if backend() == Backend::Gpu {
-            tracing::warn!("GPU backend requested but no usable GPU; mining on CPU");
+        Backend::Gpu => {
+            if let Some(g) = shared() {
+                return g.mine_gpu(midstate, target, pool_target, cancel, hash_counter);
+            }
+            tracing::warn!("GPU backend requested but no usable wgpu/Vulkan device; mining on CPU");
+        }
+        Backend::Auto => {
+            if let Some(cuda) = super::cuda_mining::shared() {
+                return cuda.mine_gpu(midstate, target, pool_target, cancel, hash_counter);
+            }
+            if let Some(g) = shared() {
+                return g.mine_gpu(midstate, target, pool_target, cancel, hash_counter);
+            }
         }
     }
     mine_extension(midstate, target, pool_target, threads, cancel, hash_counter)

@@ -24,8 +24,8 @@ struct Cli {
     #[arg(long = "audit-url")]
     audit_url: Option<String>,
 
-    /// Mining backend: auto, gpu, or cpu
-    #[arg(long, default_value = "gpu")]
+    /// Mining backend: auto, cuda, gpu, or cpu
+    #[arg(long, default_value = "auto")]
     backend: String,
 
     /// CPU worker threads if CPU fallback is used. 0 = use all available cores.
@@ -50,12 +50,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     midstate::core::gpu_mining::set_backend(match cli.backend.to_ascii_lowercase().as_str() {
+        "cuda" => midstate::core::gpu_mining::Backend::Cuda,
         "gpu" => midstate::core::gpu_mining::Backend::Gpu,
         "cpu" => midstate::core::gpu_mining::Backend::Cpu,
         "auto" => midstate::core::gpu_mining::Backend::Auto,
         other => {
-            tracing::warn!("unknown --backend '{other}', using gpu");
-            midstate::core::gpu_mining::Backend::Gpu
+            tracing::warn!("unknown --backend '{other}', using auto");
+            midstate::core::gpu_mining::Backend::Auto
         }
     });
 

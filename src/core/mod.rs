@@ -12,6 +12,8 @@ pub mod simd_mining;
 pub mod wots_simd;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_mining;  
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cuda_mining;
 
 pub use finality::*;
 pub use types::*;

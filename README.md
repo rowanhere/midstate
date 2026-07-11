@@ -163,10 +163,13 @@ cargo build --release --bin miner
 ./target/release/miner \
   --pool-url stratum+tcp://<MACHINE_A_IP>:3333 \
   --address <MINER_MSS_PAYOUT_ADDRESS> \
-  --worker rig1
+  --worker rig1 \
+  --backend cuda
 ```
 
-The standalone miner does not need a local node or chain sync. It uses every usable GPU adapter detected by `wgpu` on the best available backend, and it CPU-verifies every surfaced share before submission.
+The standalone miner does not need a local node or chain sync. Use `--backend cuda` for NVIDIA rigs that have CUDA but broken/missing Vulkan, `--backend gpu` for the older wgpu/Vulkan path, or `--backend auto` to try CUDA first and then wgpu. It CPU-verifies every surfaced share before submission.
+
+For the CUDA backend, the NVIDIA driver must expose `libcuda.so.1` and the box must have NVRTC (`libnvrtc.so`) installed. If `nvidia-smi` works but CUDA mining says NVRTC is missing, install the CUDA NVRTC runtime package from your distro/NVIDIA repo, then rebuild.
 
 If your audit API is not on the default paired port, pass it explicitly:
 
@@ -175,7 +178,8 @@ If your audit API is not on the default paired port, pass it explicitly:
   --pool-url stratum+tcp://<MACHINE_A_IP>:2606 \
   --audit-url http://<MACHINE_A_IP>:8081 \
   --address <MINER_MSS_PAYOUT_ADDRESS> \
-  --worker rig1
+  --worker rig1 \
+  --backend cuda
 ```
 
 For Clore-style forwarded ports where container `3333` is public as
@@ -195,8 +199,9 @@ Then point the remote miner at the forwarded Stratum port and HTTPS audit URL:
 ./target/release/miner \
   --pool-url stratum+tcp://n1.de.clorecloud.net:2606 \
   --audit-url https://tgq7btzq1bf4a.clorecloud.net \
-  --address <MINER_MSS_PAYOUT_ADDRESS> \
-  --worker rig1
+  --address 83f6b07e07493619a662812713db46bbf202e26934d51cb7b7eafc4cf0d2f25a \
+  --worker rig1 \
+  --backend cuda
 ```
 
 ## CLI Reference
