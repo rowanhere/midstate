@@ -35,6 +35,10 @@ struct Cli {
     /// Optional GPU duty cycle between 0.02 and 1.0
     #[arg(long = "gpu-duty")]
     gpu_duty: Option<f32>,
+
+    /// Print miner dashboard automatically every N seconds. 0 = only on ENTER.
+    #[arg(long = "stats-interval", default_value_t = 0)]
+    stats_interval: u64,
 }
 
 #[tokio::main]
@@ -67,7 +71,11 @@ async fn main() -> Result<()> {
     let hash_counter = Arc::new(AtomicU64::new(0));
     let stats = Arc::new(RwLock::new(midstate::mining::StratumStats::default()));
 
-    midstate::mining::spawn_stratum_dashboard(hash_counter.clone(), stats.clone());
+    midstate::mining::spawn_stratum_dashboard(
+        hash_counter.clone(),
+        stats.clone(),
+        (cli.stats_interval > 0).then_some(cli.stats_interval),
+    );
 
     tracing::info!(
         "starting standalone miner (backend: {}, threads: {})",
@@ -78,7 +86,14 @@ async fn main() -> Result<()> {
             cli.threads.to_string()
         }
     );
-    tracing::info!("press [ENTER] at any time to view dashboard");
+    if cli.stats_interval > 0 {
+        tracing::info!(
+            "printing dashboard every {}s; press [ENTER] to view immediately",
+            cli.stats_interval
+        );
+    } else {
+        tracing::info!("press [ENTER] at any time to view dashboard");
+    }
 
     midstate::mining::run_stratum_client_with_options(
         midstate::mining::StratumClientOptions {

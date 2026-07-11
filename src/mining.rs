@@ -235,6 +235,7 @@ fn normalize_audit_base_url(audit_url: &str) -> String {
 pub fn spawn_stratum_dashboard(
     hash_counter: Arc<AtomicU64>,
     stats: Arc<std::sync::RwLock<StratumStats>>,
+    stats_interval_secs: Option<u64>,
 ) {
     let hc = hash_counter.clone();
     let stats_clone = stats.clone();
@@ -242,8 +243,10 @@ pub fn spawn_stratum_dashboard(
     tokio::spawn(async move {
         use tokio::io::AsyncBufReadExt;
 
-        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let mut line = String::new();
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        let mut ticker = stats_interval_secs
+            .filter(|s| *s > 0)
+            .map(|s| tokio::time::interval(std::time::Duration::from_secs(s)));
         let mut last_hashes = 0;
         let mut last_time = Instant::now();
         let mut last_cuda_nonces: std::collections::BTreeMap<i32, u64> =
@@ -280,11 +283,38 @@ pub fn spawn_stratum_dashboard(
             format!("{:.1} years", secs / 31536000.0)
         }
 
+        fn format_hashrate(rate: f64) -> String {
+            let units = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s"];
+            let mut value = rate.max(0.0);
+            let mut unit = 0usize;
+            while value >= 1000.0 && unit + 1 < units.len() {
+                value /= 1000.0;
+                unit += 1;
+            }
+            if value >= 100.0 {
+                format!("{value:.0} {}", units[unit])
+            } else if value >= 10.0 {
+                format!("{value:.1} {}", units[unit])
+            } else {
+                format!("{value:.2} {}", units[unit])
+            }
+        }
+
         let share_target_f64 = u256_to_f64(primitive_types::U256::from_big_endian(&share_target));
 
         loop {
-            line.clear();
-            if stdin.read_line(&mut line).await.unwrap_or(0) == 0 {
+            if let Some(ticker) = ticker.as_mut() {
+                tokio::select! {
+                    line = lines.next_line() => {
+                        match line {
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                    _ = ticker.tick() => {}
+                }
+            } else if lines.next_line().await.unwrap_or(None).is_none() {
                 break;
             }
 
@@ -298,7 +328,7 @@ pub fn spawn_stratum_dashboard(
             };
 
             println!("\n== MINER STATUS ==");
-            println!("Hashrate:      {:.2} nonces/s", rate);
+            println!("Hashrate:      {}", format_hashrate(rate));
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let cuda = crate::core::cuda_mining::cuda_dashboard_snapshot();
@@ -314,9 +344,9 @@ pub fn spawn_stratum_dashboard(
                             0.0
                         };
                         println!(
-                            "  GPU {:>2}: {:>10.2} nonces/s | shares {} | blocks {} | {}",
+                            "  GPU {:>2}: {:>10} | shares {} | blocks {} | {}",
                             gpu.ordinal,
-                            gpu_rate,
+                            format_hashrate(gpu_rate),
                             gpu.accepted_shares,
                             gpu.accepted_blocks,
                             gpu.name
@@ -344,7 +374,7 @@ pub fn spawn_stratum_dashboard(
                     0.0
                 };
 
-                println!("Network:       {:.2} nonces/s", network_nps);
+                println!("Network:       {}", format_hashrate(network_nps));
 
                 if share_pct < 0.001 {
                     println!("Your Share:    < 0.001%");
